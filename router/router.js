@@ -23,10 +23,13 @@ const db = require('../dbhandle/dbhandler'),
             db.release(req, res, 'suger', 'articalList');
         },
         // 评论
-        '/reply': (req, res, next) => {
-            db.reply(req, res, 'suger', 'articalComment');
+        '/addComment': (req, res, next) => {
+            db.addComment(req, res, 'suger', 'articalComment');
         },
-
+        // 点赞
+        '/liked': (req, res, next) => {
+            db.liked(req, res, 'suger', 'likeCount');
+        },
         '/uploadImg': (req, res, next) => {
             res.writeHeader('200');
             const form = new formidable.IncomingForm(),

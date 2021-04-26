@@ -1,5 +1,5 @@
 const { ObjectId } = require('mongodb');
-
+const { transDBTime } = require('../auxiliaryFns/filters');
 const MongoClient = require('mongodb').MongoClient,
     jwt = require('jsonwebtoken'),
     url = 'mongodb://127.0.0.1:27017';
@@ -140,26 +140,32 @@ function getComment(conditions, res, databaseName, sheet, userId) {
                             from: 'articalComment',
                             localField: '_id',
                             foreignField: 'toComment',
-                            as: 'comments',
+                            as: 'commentReply',
                         },
                     },
                     {
                         $lookup: {
                             from: 'userList',
-                            localField: 'comments.author',
+                            localField: 'commentReply.author',
                             foreignField: '_id',
-                            as: '[comments]',
+                            as: '[commentReply]',
                         },
                     },
                     {
                         $project: {
                             time: 1,
                             content: 1,
-                            comments: 1,
+                            'commentReply.content': 1,
+                            'commentReply.likeId': 1,
+                            'commentReply.author': 1,
+                            'commentReply.time': 1,
+                            'commentReply._id': 1,
+                            'commentReply.replyTo': 1,
                             any: 1,
                             'user.aliasName': 1,
                             'user._id': 1,
                             'user.avatar': 1,
+                            'likedList._id': 1,
                             'likedList.like': 1,
                             'likedList.dislike': 1,
                             commentReplyLiked: 1,
@@ -170,7 +176,12 @@ function getComment(conditions, res, databaseName, sheet, userId) {
                 ])
                 .toArray()
                 .then((result) => {
+                    // 根据二级评论的user，like，查询用户信息和点赞信息
+                    const userMap = new Map(),
+                        likeMap = new Map();
                     result.map((item) => {
+                        item.time = transDBTime(item.time);
+                        item.likeId = item.likedList._id;
                         item.likeCount = item.likedList.like.length;
                         item.dislikeCount = item.likedList.dislike.length;
                         item.liked = 0;
@@ -180,14 +191,107 @@ function getComment(conditions, res, databaseName, sheet, userId) {
                             item.liked = -1;
                         }
                         delete item.likedList;
+                        // 收集评论user,回复对象，like
+                        item.commentReply.map((comment) => {
+                            if (!userMap.has(comment.author)) {
+                                userMap.set(comment.author, '');
+                            }
+                            if (
+                                comment.replyTo &&
+                                !userMap.has(comment.replyTo)
+                            ) {
+                                userMap.set(comment.replyTo, '');
+                            }
+                            // 收集like
+                            likeMap.set(comment.likeId, '');
+                        });
                     });
-                    const respond = {
-                        code: 200,
-                        data: result,
-                    };
-                    client.close();
-                    res.write(JSON.stringify(respond));
-                    res.end();
+                    const queryUser = [],
+                        queryLike = [];
+                    for (let i of userMap.keys()) {
+                        queryUser.push({ _id: i });
+                    }
+                    for (let i of likeMap.keys()) {
+                        queryLike.push({ _id: i });
+                    }
+                    // 根据 userMap/likeMap 查询数据库
+                    Promise.all([
+                        dbase
+                            .collection('userList')
+                            .aggregate([
+                                {
+                                    $match: { $or: queryUser },
+                                },
+                                {
+                                    $project: {
+                                        aliasName: 1,
+                                        avatar: 1,
+                                        _id: 1,
+                                    },
+                                },
+                            ])
+                            .toArray(),
+                        dbase
+                            .collection('likeCount')
+                            .aggregate([
+                                {
+                                    $match: { $or: queryLike },
+                                },
+                                {
+                                    $project: {
+                                        _id: 1,
+                                        dislike: 1,
+                                        like: 1,
+                                    },
+                                },
+                            ])
+                            .toArray(),
+                    ]).then((ret) => {
+                        const [userList, likeList] = ret,
+                            objByUser = new Map(),
+                            objBylike = new Map();
+                        userList.map((user) => {
+                            objByUser.set(user._id.toString(), user);
+                        });
+                        likeList.map((like) => {
+                            objBylike.set(like._id.toString(), like);
+                        });
+                        result.map((item) => {
+                            item.commentReply.map((comment) => {
+                                comment.user = objByUser.get(
+                                    comment.author.toString()
+                                );
+                                comment.reply =
+                                    comment.replyTo &&
+                                    objByUser.get(comment.replyTo.toString());
+                                comment.likeList = objBylike.get(
+                                    comment.likeId.toString()
+                                );
+                                // 二级评论转换
+                                comment.time = transDBTime(comment.time);
+                                comment.likeCount =
+                                    comment.likeList.like.length;
+                                comment.dislikeCount =
+                                    comment.likeList.dislike.length;
+                                comment.liked = 0;
+                                if (comment.likeList.like.includes(userId)) {
+                                    comment.liked = 1;
+                                } else if (
+                                    comment.likeList.dislike.includes(userId)
+                                ) {
+                                    comment.liked = -1;
+                                }
+                                delete comment.likeList;
+                            });
+                        });
+                        const respond = {
+                            code: 200,
+                            data: result,
+                        };
+                        client.close();
+                        res.write(JSON.stringify(respond));
+                        res.end();
+                    });
                 })
                 .catch((err) => {
                     console.log(err);
@@ -250,6 +354,7 @@ function getArtical(conditions, res, databaseName, sheet, userId) {
                             'user._id': 1,
                             'user.avatar': 1,
                             'user.description': 1,
+                            'likedList._id': 1,
                             'likedList.like': 1,
                             'likedList.dislike': 1,
                             commentTotal: {
@@ -261,6 +366,8 @@ function getArtical(conditions, res, databaseName, sheet, userId) {
                 .toArray()
                 .then((articalList) => {
                     articalList.map((item) => {
+                        item.time = transDBTime(item.time);
+                        item.likeId = item.likedList._id;
                         item.likeCount = item.likedList.like.length;
                         item.dislikeCount = item.likedList.dislike.length;
                         item.liked = 0;
@@ -285,6 +392,7 @@ function getArtical(conditions, res, databaseName, sheet, userId) {
         }
     );
 }
+// 发布文章
 function release(req, res, databaseName, sheet) {
     MongoClient.connect(
         url,
@@ -292,19 +400,32 @@ function release(req, res, databaseName, sheet) {
         function (err, client) {
             if (err) throw err;
             var addData = req.body,
-                decodeToken = jwt.verify(req.cookies.token, 'userpwd'),
+                userId = jwt.verify(req.cookies.token, 'userpwd').id,
                 dbase = client.db(databaseName);
-            const _id = new ObjectId(),
-                user = {
-                    commentId: _id,
-                    userId: decodeToken.id,
+            const likeId = new ObjectId(),
+                content = {
+                    content: addData.content,
+                    userId: new ObjectId(userId),
+                    likeId,
+                    commentId: '',
+                    time: new Date(),
                 };
-            Object.assign(addData, user);
             dbase
                 .collection(sheet)
-                .insertOne(addData)
-                .then((back) => {
-                    addEmptyComments(res, _id);
+                .insertOne(content, function (err, addArticalResult) {
+                    dbase
+                        .collection('likeCount')
+                        .insertOne(
+                            { _id: likeId, like: [], dislike: [] },
+                            function (err, addLiked) {
+                                const params = {
+                                    code: 200,
+                                    data: '插入成功',
+                                };
+                                client.close();
+                                res.json(params);
+                            }
+                        );
                 });
         }
     );
@@ -323,7 +444,12 @@ function login(user, res, databaseName, sheet) {
                     if (err) throw err;
                     let params = {};
                     if (respond.length) {
-                        const { _id: id, userName, avatar } = respond[0];
+                        const {
+                            _id: id,
+                            userName,
+                            aliasName,
+                            avatar,
+                        } = respond[0];
                         const token = jwt.sign(
                             {
                                 id,
@@ -358,51 +484,100 @@ function login(user, res, databaseName, sheet) {
         }
     );
 }
-//评论
-function reply(req, res, databaseName, sheet) {
+//评论 文章/评论
+function addComment(req, res, databaseName, sheet) {
     MongoClient.connect(
         url,
         { useUnifiedTopology: true },
         function (err, client) {
+            // 对文章进行评论，需要添加新的数据到likeCount
             if (err) throw err;
             var body = req.body.params,
                 decodeToken = jwt.verify(req.cookies.token, 'userpwd'),
                 dbase = client.db(databaseName);
-            let conditions,
-                push,
-                addData = {
-                    _id: new ObjectId(),
+            let likeId = new ObjectId(),
+                addComment = {
+                    likeId,
+                    time: new Date(),
                     content: body.content,
-                    userId: decodeToken.id,
-                    replyTo: body.replyTo ? body.replyTo : '', //回复对象
-                    children: [],
+                    author: new ObjectId(decodeToken.id),
+                    replyTo: body.replyTo ? new ObjectId(body.replyTo) : '', //回复对象
+                    toArtical: new ObjectId(body.toArtical), //回复所属文章
+                    toComment: body.toComment
+                        ? new ObjectId(body.toComment)
+                        : '', //回复评论
                 };
-            // 回复评论
-            if (body.replyCommentId) {
-                conditions = {
-                    'children._id': ObjectId(body.replyCommentId),
-                };
-                push = { 'children.$.children': addData };
-            } else {
-                conditions = {
-                    _id: ObjectId(body.replyArticalId),
-                };
-                push = {
-                    children: addData,
-                };
-            }
-
-            dbase
-                .collection(sheet)
-                .updateOne(conditions, { $push: push }, null, function (back) {
-                    const params = {
-                        code: 200,
-                        data: '插入成功',
-                    };
-                    client.close();
-                    res.json(params);
-                });
+            // 插入评论，插入评论的like属性
+            dbase.collection(sheet).insertOne(addComment, function (back) {
+                // 插入评论对应的like
+                dbase
+                    .collection('likeCount')
+                    .insertOne(
+                        { _id: likeId, like: [], dislike: [] },
+                        function (result) {
+                            const params = {
+                                code: 200,
+                                data: '插入成功',
+                            };
+                            client.close();
+                            res.json(params);
+                        }
+                    );
+            });
         }
     );
 }
-module.exports = { getComment, getArtical, release, login, reply };
+// 点赞
+function liked(req, res, databaseName, sheet) {
+    const body = req.body.params,
+        userId = jwt.verify(req.cookies.token, 'userpwd').id;
+    const { _id, from, to } = body,
+        params = { _id: ObjectId(_id) };
+
+    MongoClient.connect(
+        url,
+        { useUnifiedTopology: true },
+        function (err, client) {
+            if (err) return;
+            const dataList = client.db(databaseName).collection(sheet);
+            dataList.findOne(params, function (err, result) {
+                if (err) return;
+                const { like, dislike } = result;
+                if (from == 1 && to == 1) {
+                    like.splice(like.indexOf(userId), 1);
+                } else if (from == -1 && to == -1) {
+                    dislike.splice(dislike.indexOf(userId), 1);
+                } else if (from == -1 && to == 1) {
+                    dislike.splice(dislike.indexOf(userId), 1);
+                    like.push(userId);
+                } else if (from == 1 && to == -1) {
+                    like.splice(like.indexOf(userId), 1);
+                    dislike.push(userId);
+                } else if (from == 0) {
+                    if (to == 1) {
+                        like.push(userId);
+                    } else {
+                        dislike.push(userId);
+                    }
+                }
+                dataList.updateOne(
+                    params,
+                    { $set: { like: like, dislike: dislike } },
+                    function (err, result) {
+                        if (err) {
+                            return;
+                        } else {
+                            const params = {
+                                code: 200,
+                                data: '修改成功',
+                            };
+                            client.close();
+                            res.json(params);
+                        }
+                    }
+                );
+            });
+        }
+    );
+}
+module.exports = { getComment, getArtical, release, login, addComment, liked };
